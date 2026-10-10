@@ -5,6 +5,8 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.*;
 import org.json.JSONObject;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 
 final class DeviceStore extends SQLiteOpenHelper {
     DeviceStore(Context c) { super(c, "flowbot.db", null, 1); }
@@ -32,6 +34,13 @@ final class DeviceStore extends SQLiteOpenHelper {
     synchronized void queue(String id, String path, JSONObject body) {
         ContentValues v = new ContentValues(); v.put("id", id); v.put("path", path); v.put("body", body.toString());
         getWritableDatabase().insertWithOnConflict("outbox", null, v, SQLiteDatabase.CONFLICT_IGNORE);
+    }
+    synchronized void incoming(String contact,String text,String identity,String source) throws Exception {
+        if (text.trim().isEmpty() || text.length()>4000 || "[新消息]".equals(text) || "你收到了一条新消息".equals(text)) return;
+        byte[] digest=MessageDigest.getInstance("SHA-256").digest((identity+"\0"+contact+"\0"+text).getBytes(StandardCharsets.UTF_8));
+        StringBuilder key=new StringBuilder(); for(byte b:digest) key.append(String.format("%02x",b));
+        JSONObject event=new JSONObject().put("event_id",key.toString()).put("contact",contact).put("text",text).put("source",source);
+        queue("incoming:"+key,"/device/incoming",event);
     }
     synchronized String[] next() {
         try (Cursor c = getReadableDatabase().rawQuery("SELECT id,path,body FROM outbox ORDER BY rowid LIMIT 1", null)) {
