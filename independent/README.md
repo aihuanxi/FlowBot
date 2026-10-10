@@ -2,6 +2,8 @@
 
 独立的 Python 后端和 Android 执行端，不连接作者托管平台。第一期交付 APK、HTTP API 和对外 Webhook：企业微信私聊文本进入 Agent，由 Agent 判断并通过 API 回复或主动推送。配置最多 10 个设备密钥，每台设备串行执行任务。没有网页后台或内置大模型。
 
+首次使用见 [用户手册](USER_GUIDE.md)，涵盖 APK 获取、手机权限、Agent 收发、部署恢复及常见问题；[飞书交付手册与 APK 下载](https://aihuanxi.feishu.cn/docx/NtbCdkQSjobu1VxfEs8co9g4nug)提供 0.2.0 APK 和完整交付包，访问需登录飞书并具备阅读权限。
+
 Agent 使用入口见 [AGENT.md](AGENT.md)、[OpenAPI](openapi.json) 和 [项目 Skill](skills/use-flowbot/SKILL.md)。
 
 原仓库缺少 `autojs`、`apkbuilder`、`LocalRepo`、`paddleocr` 等构建模块及完整业务后端，因此此目录单独构建。执行端沿用原仓库 `UiObject` 的节点遍历和 Android 平台动作方式，不包含原软件的编辑器、OCR 或其全部功能。

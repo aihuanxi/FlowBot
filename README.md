@@ -6,6 +6,8 @@
 
 无需作者托管平台的企业微信服务位于 [independent/](./independent/README.md)，包含独立 APK、HTTP API、对外 Webhook、[Agent 接入指南](./independent/AGENT.md)及部署恢复说明。该实现单独构建，支持配置最多 10 个设备，功能与下面介绍的原版 FlowBot 不完全相同。
 
+首次使用请读 [独立版用户手册](./independent/USER_GUIDE.md)；[飞书交付手册与 APK 下载](https://aihuanxi.feishu.cn/docx/NtbCdkQSjobu1VxfEs8co9g4nug)提供 0.2.0 APK、完整交付包、公钥证书和 OpenAPI 附件，访问时需登录飞书并具备文档阅读权限。独立版的接口以 [OpenAPI](./independent/openapi.json) 为准；下方原版 FlowBot 的下载及 Apifox 文档不适用于独立服务。
+
 ### 本程序分为安卓端 APP 和任务调度平台
 
 - 安卓端 APP 需要您 **自己提供一台手机**（需可运行企微/微信，手机型号和系统版本不限，本软件兼容 99% 的安卓手机）。
