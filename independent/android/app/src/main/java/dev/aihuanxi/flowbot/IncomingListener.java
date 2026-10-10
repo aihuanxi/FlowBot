@@ -13,7 +13,12 @@ import java.util.Set;
 
 public class IncomingListener extends NotificationListenerService {
     static volatile boolean connected;
-    public void onListenerConnected() { connected = true; }
+    public void onListenerConnected() {
+        connected = true;
+        StatusBarNotification[] notifications = getActiveNotifications();
+        if (BuildConfig.DEBUG) android.util.Log.i("FlowBotIncoming", "connected; active=" + (notifications == null ? 0 : notifications.length));
+        if (notifications != null) for (StatusBarNotification notification : notifications) onNotificationPosted(notification);
+    }
     public void onListenerDisconnected() { connected = false; }
     public void onDestroy() { connected = false; super.onDestroy(); }
     public void onNotificationPosted(StatusBarNotification sbn) {
@@ -33,7 +38,8 @@ public class IncomingListener extends NotificationListenerService {
                     }
                 } else {
                     // shortcut: only private notifications with visible text, add UI receive when foreground capture is required.
-                    String text = String.valueOf(extras.getCharSequence(Notification.EXTRA_TEXT, ""));
+                    String text = NotificationText.body(extras.getCharSequence(Notification.EXTRA_TEXT), sbn.getNotification().tickerText);
+                    if (BuildConfig.DEBUG) android.util.Log.i("FlowBotIncoming", "private notification; aggregate=" + !text.contentEquals(extras.getCharSequence(Notification.EXTRA_TEXT, "")));
                     record(db, contact, text, sbn.getKey() + ":" + sbn.getNotification().when);
                 }
             }

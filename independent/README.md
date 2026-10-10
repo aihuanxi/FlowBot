@@ -30,6 +30,14 @@ cd android
 adb -s <手机序列号> install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+通知正文校准测试不依赖 Android 或第三方测试库，在 `independent/android` 执行：
+
+```bash
+mkdir -p /tmp/flowbot-java-test
+javac -d /tmp/flowbot-java-test app/src/main/java/dev/aihuanxi/flowbot/NotificationText.java app/src/test/java/dev/aihuanxi/flowbot/NotificationTextTest.java
+java -ea -cp /tmp/flowbot-java-test dev.aihuanxi.flowbot.NotificationTextTest
+```
+
 `--init` 不覆盖已有配置。它生成独立管理密钥和设备密钥，文件权限为 `0600`；不要将配置、私钥、数据库或 APK 签名密钥提交到 Git。
 
 ## 独立服务器部署
@@ -125,7 +133,7 @@ python3 client.py --config /private/path/config.json \
 - `queued` 等待设备；`running` 正在执行；`succeeded` 表示无障碍点击后输入框清空且出现新消息气泡，**不表示对方已读或已送达**。
 - `failed` 表示未进入发送动作便失败。`unknown` 表示动作可能已执行或结果超时，必须人工核对聊天，不能直接重发。后台不会自动重试发送。
 - 领取后超过 120 秒未回报的任务在设备下一次轮询时转为 `unknown`，不会重新排队。晚到的真实结果可补齐状态。
-- 手机本地 SQLite 保存执行记录和待上传回调，断网后恢复上传。进程中断留下的执行记录标为 `unknown`，不再次执行。清除手机应用数据会丢失这些记录，不要在待验收任务期间清数据。
+- 手机本地 SQLite 保存执行记录和待上传回调，断网后恢复上传。通知服务重新连接时读取仍存在的系统通知，依据事件 ID 去重。企业微信通知包含聚合条数时，只有显示正文与系统 ticker 的原文精确对应才提取原文，不盲目删除用户消息里的 `[N条]`。进程中断留下的执行记录标为 `unknown`，不再次执行。清除手机应用数据会丢失这些记录，不要在待验收任务期间清数据。
 - 服务器重启会保留队列、消息与规则。备份或回退前停止服务，复制 `/etc/flowbot` 和整个 `/var/lib/flowbot`；回退仅替换兼容的程序，再启动服务并检查 `/health`、`/devices` 及原任务状态。
 - 只处理已配置联系人的私聊通知，不读取群聊、个人微信、历史聊天、图片或文件。通知未显示正文、被系统抑制、当前聊天处于前台时可能无法接收；目前没有 UI 收消息补充路径。联系人需名称精确匹配且唯一，不会猜测相似名称。
 - 手机 UI 自动化依赖实际企业微信界面。联系人重名、未发送草稿、锁屏或选择器失效会停止该任务，保留可诊断结果；升级系统或企业微信后先用测试联系人验收。
