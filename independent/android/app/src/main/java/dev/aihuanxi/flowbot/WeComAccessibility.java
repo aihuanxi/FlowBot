@@ -15,8 +15,64 @@ public class WeComAccessibility extends AccessibilityService {
     static volatile WeComAccessibility instance;
     private final Handler main = new Handler(Looper.getMainLooper());
     private static final String PACKAGE = "com.tencent.wework";
+    private final ConversationDelta incoming = new ConversationDelta();
+    private String activeContact = "";
+    private boolean receivingScheduled;
     public void onServiceConnected() { instance = this; }
-    public void onAccessibilityEvent(AccessibilityEvent event) { }
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) incoming.reset();
+        if (!receivingScheduled) {
+            receivingScheduled = true;
+            main.postDelayed(() -> { receivingScheduled = false; receiveVisible(); }, 200);
+        }
+    }
+    private void receiveVisible() {
+        List<AccessibilityNodeInfo> list = nodes();
+        try {
+            String contact = null; AccessibilityNodeInfo messages = null; int edits = 0;
+            for (AccessibilityNodeInfo n : list) {
+                if (n.isEditable()) edits++;
+                if ("com.tencent.wework:id/nwv".equals(n.getViewIdResourceName()) && n.getText()!=null) contact=n.getText().toString();
+                if ("com.tencent.wework:id/iy0".equals(n.getViewIdResourceName())) messages=n;
+            }
+            // shortcut: foreground fallback covers explicitly subscribed private contacts on WeCom 5.0.11; recalibrate other versions.
+            if (contact==null || messages==null || edits!=1 || !getSharedPreferences("state",0).getStringSet("contacts", Collections.emptySet()).contains(contact)) {
+                incoming.reset(); activeContact=""; return;
+            }
+            if (!contact.equals(activeContact)) { incoming.reset(); activeContact=contact; }
+            List<String> keys=new ArrayList<>(), texts=new ArrayList<>(); List<Boolean> received=new ArrayList<>();
+            for (int i=0; i<messages.getChildCount(); i++) {
+                AccessibilityNodeInfo row=messages.getChild(i);
+                if (row==null) continue;
+                try {
+                    AccessibilityNodeInfo.CollectionItemInfo position=row.getCollectionItemInfo();
+                    String body=findText(row,"com.tencent.wework:id/ilm");
+                    if (position==null || body==null) continue;
+                    boolean fromContact=containsId(row,"com.tencent.wework:id/i5g");
+                    boolean fromSelf=containsId(row,"com.tencent.wework:id/i4o");
+                    if (fromContact==fromSelf) continue;
+                    keys.add(position.getRowIndex()+":"+(fromContact ? "I:" : "O:")+body); texts.add(body); received.add(fromContact);
+                } finally { row.recycle(); }
+            }
+            int start=incoming.update(keys);
+            try (DeviceStore db=new DeviceStore(this)) {
+                for (int i=start; i<keys.size(); i++) if (received.get(i))
+                    db.incoming(contact,texts.get(i),"ui:"+UUID.randomUUID(),"wecom_accessibility");
+            }
+        } catch (Exception e) {
+            getSharedPreferences("state",0).edit().putString("status","前台接收异常："+e.getClass().getSimpleName()).apply();
+        } finally { for (AccessibilityNodeInfo n:list) n.recycle(); }
+    }
+    private String findText(AccessibilityNodeInfo n,String id) {
+        if (id.equals(n.getViewIdResourceName()) && n.getText()!=null) return n.getText().toString();
+        for (int i=0; i<n.getChildCount(); i++) { AccessibilityNodeInfo child=n.getChild(i); if (child!=null) { try { String found=findText(child,id); if (found!=null) return found; } finally { child.recycle(); } } }
+        return null;
+    }
+    private boolean containsId(AccessibilityNodeInfo n,String id) {
+        if (id.equals(n.getViewIdResourceName())) return true;
+        for (int i=0; i<n.getChildCount(); i++) { AccessibilityNodeInfo child=n.getChild(i); if (child!=null) { try { if (containsId(child,id)) return true; } finally { child.recycle(); } } }
+        return false;
+    }
     public void onInterrupt() { }
     public void onDestroy() { instance = null; super.onDestroy(); }
 
@@ -83,6 +139,7 @@ public class WeComAccessibility extends AccessibilityService {
             require(!contact.trim().isEmpty() && !message.trim().isEmpty() && message.length() <= 2000, "非法文本任务");
             require(!getSystemService(android.app.KeyguardManager.class).isKeyguardLocked(), "手机锁定");
             ui(() -> {
+                incoming.reset(); activeContact="";
                 Intent launch = getPackageManager().getLaunchIntentForPackage(PACKAGE);
                 if (launch == null) throw new IllegalStateException("未安装企业微信");
                 launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(launch); return true;
@@ -115,7 +172,7 @@ public class WeComAccessibility extends AccessibilityService {
             }
             require(confirmed, "发送后的新消息气泡未确认，请人工核对");
             result.put("status", "succeeded").put("detail", "AccessibilityService ACTION_SET_TEXT/ACTION_CLICK；会话标题、清空输入框与新增文本气泡已确认；不代表对方已读");
-            ui(() -> performGlobalAction(GLOBAL_ACTION_HOME));
+            ui(() -> { incoming.reset(); activeContact=""; return performGlobalAction(GLOBAL_ACTION_HOME); });
         } catch (InterruptedException e) {
             result.put("status", attempted ? "unknown" : "failed").put("detail", "执行被停止，请人工核对");
         } catch (Exception e) {

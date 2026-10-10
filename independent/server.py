@@ -10,9 +10,13 @@ import re
 import secrets
 import sqlite3
 import ssl
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qs
+from urllib.request import Request, build_opener, HTTPSHandler, HTTPRedirectHandler
+from urllib.error import HTTPError
 
 
 def nonempty(value, name, limit):
@@ -39,7 +43,18 @@ class Store:
                 CREATE TABLE IF NOT EXISTS rules (
                     device_id TEXT NOT NULL, contact TEXT NOT NULL, trigger TEXT NOT NULL,
                     reply TEXT NOT NULL, PRIMARY KEY(device_id, contact));
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    device_id TEXT PRIMARY KEY, contacts TEXT NOT NULL, listen_all INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS webhook (
+                    id INTEGER PRIMARY KEY CHECK(id=1), url TEXT NOT NULL, token TEXT NOT NULL,
+                    ca_pem TEXT NOT NULL, enabled INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    event_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
+                    last_status INTEGER, last_error TEXT NOT NULL DEFAULT '', updated REAL NOT NULL);
             """)
+            # A crash may happen after remote receipt but before local acknowledgment.
+            db.execute("UPDATE webhook_deliveries SET status='pending' WHERE status='sending'")
             for device in device_ids:
                 db.execute("INSERT OR IGNORE INTO devices(id) VALUES(?)", (device,))
 
@@ -75,6 +90,9 @@ class Store:
                        "WHERE device_id=? AND status='running' AND updated<?", (now, device, now-120))
             contacts = [r[0] for r in db.execute("SELECT contact FROM tasks WHERE device_id=? "
                        "UNION SELECT contact FROM rules WHERE device_id=?", (device, device))]
+            subscription = db.execute('SELECT * FROM subscriptions WHERE device_id=?', (device,)).fetchone()
+            if subscription:
+                contacts = json.loads(subscription['contacts'])
             task = None
             running = db.execute("SELECT 1 FROM tasks WHERE device_id=? AND status='running'", (device,)).fetchone()
             if state.get('ready') is True and not running:
@@ -83,7 +101,8 @@ class Store:
                 if row:
                     db.execute("UPDATE tasks SET status='running',updated=? WHERE id=?", (now, row[0]))
                     task = self.task(db, row[0])
-            return {'task': task, 'allowed_contacts': contacts}
+            return {'task': task, 'allowed_contacts': contacts,
+                    'listen_all': bool(subscription and subscription['listen_all'])}
 
     def result(self, device, body):
         task_id = nonempty(body.get('task_id'), 'task_id', 100)
@@ -107,7 +126,7 @@ class Store:
         text = nonempty(body.get('text'), 'text', 4000)
         event_id = nonempty(body.get('event_id'), 'event_id', 200)
         source = body.get('source')
-        if source != 'wecom_notification':
+        if source not in ('wecom_notification', 'wecom_accessibility'):
             raise ValueError('unsupported incoming source')
         # Namespace IDs by device so two phones cannot overwrite each other's events.
         key = hashlib.sha256((device + '\0' + event_id).encode()).hexdigest()
@@ -116,6 +135,9 @@ class Store:
             allowed = db.execute("SELECT 1 FROM tasks WHERE device_id=? AND contact=? "
                                  "UNION SELECT 1 FROM rules WHERE device_id=? AND contact=?",
                                  (device, contact, device, contact)).fetchone()
+            subscription = db.execute('SELECT * FROM subscriptions WHERE device_id=?', (device,)).fetchone()
+            if subscription:
+                allowed = subscription['listen_all'] or contact in json.loads(subscription['contacts'])
             if not allowed:
                 raise ValueError('contact is not configured for this device')
             old = db.execute("SELECT * FROM events WHERE id=?", (key,)).fetchone()
@@ -125,11 +147,106 @@ class Store:
                 return {'event_id': key, 'duplicate': True}
             db.execute("INSERT INTO events VALUES(?,?,?,?,?,?)",
                        (key, device, contact, text, source, time.time()))
+            if db.execute('SELECT 1 FROM webhook WHERE enabled=1').fetchone():
+                db.execute('INSERT INTO webhook_deliveries(event_id,updated) VALUES(?,?)', (key, time.time()))
             rule = db.execute("SELECT * FROM rules WHERE device_id=? AND contact=?", (device, contact)).fetchone()
             reply = None
             if rule and text == rule['trigger'] and text != rule['reply']:
                 reply = self.enqueue(db, device, contact, rule['reply'], 'reply:' + key)
             return {'event_id': key, 'duplicate': False, 'reply_task': reply}
+
+    def claim_delivery(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            config = db.execute('SELECT * FROM webhook WHERE enabled=1').fetchone()
+            if not config:
+                return None
+            row = db.execute("SELECT d.event_id,d.attempts,e.* FROM webhook_deliveries d "
+                             "JOIN events e ON e.id=d.event_id WHERE d.status IN ('pending','retry') "
+                             'AND d.next_attempt<=? ORDER BY e.received LIMIT 1', (time.time(),)).fetchone()
+            if not row:
+                return None
+            db.execute("UPDATE webhook_deliveries SET status='sending',attempts=attempts+1,updated=? "
+                       'WHERE event_id=?', (time.time(), row['event_id']))
+            return dict(config), dict(row)
+
+    def finish_delivery(self, event, status, error):
+        success = status is not None and 200 <= status < 300
+        now = time.time()
+        with self.connect() as db:
+            db.execute('UPDATE webhook_deliveries SET status=?,next_attempt=?,last_status=?,last_error=?,updated=? WHERE event_id=?',
+                       ('delivered' if success else 'retry', now + min(300, 2 ** min(event['attempts'] + 1, 9)),
+                        status, error, now, event['event_id']))
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def validate_webhook(body):
+    url = nonempty(body.get('url'), 'url', 2000)
+    parsed = urlsplit(url)
+    parsed.port  # Validate malformed ports before saving configuration.
+    local = parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost', '::1')
+    if (not local and parsed.scheme != 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError('webhook requires HTTPS (HTTP only for loopback tests)')
+    token = nonempty(body.get('token'), 'token', 200)
+    if len(token) < 32 or not token.isascii() or '\r' in token or '\n' in token:
+        raise ValueError('webhook token must be at least 32 characters without newlines')
+    enabled = body.get('enabled', True)
+    if not isinstance(enabled, bool):
+        raise ValueError('enabled must be boolean')
+    ca = body.get('ca_pem', '')
+    if not isinstance(ca, str):
+        raise ValueError('ca_pem must be PEM text')
+    if ca:
+        try:
+            ssl.create_default_context(cadata=ca)
+        except ssl.SSLError as e:
+            raise ValueError('invalid ca_pem') from e
+    return url, token, ca, enabled
+
+
+class FlowBotServer(ThreadingHTTPServer):
+    def start_dispatcher(self):
+        self.stopping = threading.Event()
+        self.dispatcher = threading.Thread(target=self.dispatch, daemon=True)
+        self.dispatcher.start()
+
+    def dispatch(self):
+        while not self.stopping.is_set():
+            try:
+                claimed = self.store.claim_delivery()
+                if not claimed:
+                    self.stopping.wait(1)
+                    continue
+                config, event = claimed
+                payload = {'type': 'message.received', 'event_id': event['event_id'],
+                           'device_id': event['device_id'], 'contact': event['contact'],
+                           'text': event['text'], 'source': event['source'], 'received_at': event['received']}
+                status, error = None, ''
+                try:
+                    context = ssl.create_default_context(cadata=config['ca_pem'] or None)
+                    opener = build_opener(NoRedirect(), HTTPSHandler(context=context))
+                    request = Request(config['url'], data=json.dumps(payload, ensure_ascii=False).encode(),
+                                      headers={'Authorization': 'Bearer ' + config['token'], 'Content-Type': 'application/json'})
+                    with opener.open(request, timeout=5) as response:
+                        status = response.status
+                except HTTPError as e:
+                    status, error = e.code, 'HTTP ' + str(e.code)
+                    e.close()
+                except Exception as e:
+                    error = type(e).__name__
+                self.store.finish_delivery(event, status, error)
+            except Exception as e:
+                print('Webhook worker error: ' + type(e).__name__, flush=True)
+                self.stopping.wait(1)
+
+    def server_close(self):
+        self.stopping.set()
+        self.dispatcher.join(6)
+        super().server_close()
 
 
 class Api(BaseHTTPRequestHandler):
@@ -183,6 +300,34 @@ class Api(BaseHTTPRequestHandler):
                 return self.respond(200, store.result(device, body))
             if self.command == 'POST' and path == '/device/incoming':
                 return self.respond(200, store.receive(device, body))
+            if admin and path == '/subscriptions' and self.command == 'POST':
+                device = body.get('device_id')
+                contacts, listen_all = body.get('contacts', []), body.get('listen_all', False)
+                if device not in config['devices'] or not isinstance(contacts, list) or len(contacts) > 100 or not isinstance(listen_all, bool):
+                    raise ValueError('valid device_id, contacts array (max 100), listen_all boolean required')
+                contacts = list(dict.fromkeys(nonempty(c, 'contact', 100) for c in contacts))
+                with store.connect() as db:
+                    db.execute('INSERT OR REPLACE INTO subscriptions VALUES(?,?,?)',
+                               (device, json.dumps(contacts, ensure_ascii=False), listen_all))
+                return self.respond(200, {'device_id': device, 'contacts': contacts, 'listen_all': listen_all})
+            if admin and path == '/webhook' and self.command == 'POST':
+                values = validate_webhook(body)
+                with store.connect() as db:
+                    db.execute('INSERT OR REPLACE INTO webhook VALUES(1,?,?,?,?)', values)
+                return self.respond(200, {'url': values[0], 'enabled': values[3]})
+            if admin and path.startswith('/events/') and path.endswith('/reply') and self.command == 'POST':
+                with store.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    event = db.execute('SELECT * FROM events WHERE id=?', (path[8:-6],)).fetchone()
+                    if not event:
+                        return self.respond(404, {'error': 'event not found'})
+                    if event['device_id'] not in config['devices']:
+                        raise ValueError('event device is no longer configured')
+                    text = nonempty(body.get('text'), 'text', 2000)
+                    key = nonempty(body.get('request_id', 'agent:' + event['id']), 'request_id', 100)
+                    task = store.enqueue(db, event['device_id'], event['contact'], text, 'manual:' + key)
+                    db.commit()
+                    return self.respond(201, task)
             if admin and path in ('/messages', '/rules') and self.command in ('POST', 'DELETE'):
                 device = body.get('device_id')
                 if device not in config['devices']:
@@ -193,7 +338,9 @@ class Api(BaseHTTPRequestHandler):
                     if path == '/messages' and self.command == 'POST':
                         text = nonempty(body.get('text'), 'text', 2000)
                         key = nonempty(body.get('request_id'), 'request_id', 100)
-                        return self.respond(201, store.enqueue(db, device, contact, text, 'manual:' + key))
+                        task = store.enqueue(db, device, contact, text, 'manual:' + key)
+                        db.commit()
+                        return self.respond(201, task)
                     if path == '/rules':
                         if self.command == 'DELETE':
                             db.execute('DELETE FROM rules WHERE device_id=? AND contact=?', (device, contact))
@@ -203,15 +350,37 @@ class Api(BaseHTTPRequestHandler):
                             if trigger == reply:
                                 raise ValueError('trigger and reply must differ')
                             db.execute('INSERT OR REPLACE INTO rules VALUES(?,?,?,?)', (device, contact, trigger, reply))
+                        db.commit()
                         return self.respond(200, {'ok': True})
             if admin and self.command == 'GET':
                 with store.connect() as db:
+                    if path == '/webhook':
+                        row = db.execute('SELECT url,enabled FROM webhook').fetchone()
+                        return self.respond(200, {'url': row['url'], 'enabled': bool(row['enabled'])} if row else {'enabled': False})
+                    if path == '/subscriptions':
+                        rows = [dict(r) for r in db.execute('SELECT * FROM subscriptions ORDER BY device_id')]
+                        for row in rows:
+                            row['contacts'] = json.loads(row['contacts']); row['listen_all'] = bool(row['listen_all'])
+                        return self.respond(200, rows)
+                    if path == '/events' and '?' in self.path:
+                        query = parse_qs(urlsplit(self.path).query)
+                        after, limit = int(query.get('after', ['0'])[0]), int(query.get('limit', ['100'])[0])
+                        if after < 0 or not 1 <= limit <= 100:
+                            raise ValueError('after>=0 and limit in 1..100 required')
+                        selected = query.get('device_id', [''])[0]
+                        if selected and selected not in config['devices']:
+                            raise ValueError('unknown device_id')
+                        rows = [dict(r) for r in db.execute('SELECT rowid AS cursor,* FROM events WHERE rowid>? '
+                                "AND (?='' OR device_id=?) ORDER BY rowid LIMIT ?", (after, selected, selected, limit))]
+                        return self.respond(200, {'events': rows, 'next_cursor': rows[-1]['cursor'] if rows else after})
                     if path.startswith('/tasks/'):
                         task = store.task(db, path[7:])
                         return self.respond(200 if task else 404, task or {'error': 'task not found'})
-                    table = {'/tasks': 'tasks', '/events': 'events', '/devices': 'devices', '/rules': 'rules'}.get(path)
+                    table = {'/tasks': 'tasks', '/events': 'events', '/devices': 'devices', '/rules': 'rules',
+                             '/webhook/deliveries': 'webhook_deliveries'}.get(path)
                     if table:
-                        order = {'tasks': 'created DESC', 'events': 'received DESC', 'devices': 'id', 'rules': 'device_id,contact'}[table]
+                        order = {'tasks': 'created DESC', 'events': 'received DESC', 'devices': 'id',
+                                 'rules': 'device_id,contact', 'webhook_deliveries': 'updated DESC'}[table]
                         return self.respond(200, [dict(r) for r in db.execute(f'SELECT * FROM {table} ORDER BY {order} LIMIT 100')])
             self.respond(404, {'error': 'not found'})
         except (ValueError, TypeError, KeyError) as e:
@@ -241,9 +410,10 @@ def load_config(path):
 
 
 def make_server(host, port, db_path, config):
-    server = ThreadingHTTPServer((host, port), Api)
+    server = FlowBotServer((host, port), Api)
     server.config = config
     server.store = Store(db_path, config['devices'])
+    server.start_dispatcher()
     return server
 
 

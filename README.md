@@ -4,7 +4,7 @@
 
 ### 本仓库的独立部署实现
 
-无需作者托管平台的企业微信单设备文本收发 MVP 位于 [independent/](./independent/README.md)，包含独立 Android 执行端、Python 后端、部署与恢复说明。该实现单独构建，支持配置最多 10 个设备，功能与下面介绍的原版 FlowBot 不完全相同。
+无需作者托管平台的企业微信服务位于 [independent/](./independent/README.md)，包含独立 APK、HTTP API、对外 Webhook、[Agent 接入指南](./independent/AGENT.md)及部署恢复说明。该实现单独构建，支持配置最多 10 个设备，功能与下面介绍的原版 FlowBot 不完全相同。
 
 ### 本程序分为安卓端 APP 和任务调度平台
 

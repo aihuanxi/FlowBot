@@ -82,7 +82,7 @@ public class BridgeService extends Service {
                 JSONObject response = post("/device/poll", new JSONObject().put("state", state));
                 JSONArray contacts = response.getJSONArray("allowed_contacts"); Set<String> names = new HashSet<>();
                 for (int i = 0; i < contacts.length(); i++) names.add(contacts.getString(i));
-                getSharedPreferences("state", 0).edit().putStringSet("contacts", names).apply();
+                getSharedPreferences("state", 0).edit().putStringSet("contacts", names).putBoolean("listen_all", response.optBoolean("listen_all")).apply();
                 JSONObject task = response.optJSONObject("task");
                 if (task != null && running) {
                     String id = task.getString("id"); JSONObject result = store.previous(id);
